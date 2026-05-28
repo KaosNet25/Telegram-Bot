@@ -1,8 +1,9 @@
 import imaplib
 import email
 import re
-import time
 import os
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -11,23 +12,33 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 #   export GMAIL_PASSWORD="tu_contraseña_de_aplicacion"
 #   export TELEGRAM_TOKEN="tu_token_de_telegram"
 #   export MI_CHAT_ID="tu_chat_id"
+#   export MASTER_INBOX="34kaosnet@gmail.com"
 #
 # O crea un archivo .env y usa python-dotenv para cargarlo.
 
-PASSWORD     = os.environ.get("GMAIL_PASSWORD", "")
+PASSWORD       = os.environ.get("GMAIL_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-MI_CHAT_ID   = int(os.environ.get("MI_CHAT_ID", "0"))
+MI_CHAT_ID     = int(os.environ.get("MI_CHAT_ID", "0"))
+MASTER_INBOX   = os.environ.get("MASTER_INBOX", "")
 
-if not PASSWORD or not TELEGRAM_TOKEN or not MI_CHAT_ID:
+if not PASSWORD or not TELEGRAM_TOKEN or not MI_CHAT_ID or not MASTER_INBOX:
     raise RuntimeError(
         "❌ Faltan variables de entorno.\n"
-        "Define GMAIL_PASSWORD, TELEGRAM_TOKEN y MI_CHAT_ID antes de iniciar el bot."
+        "Define GMAIL_PASSWORD, TELEGRAM_TOKEN, MI_CHAT_ID y MASTER_INBOX antes de iniciar el bot."
     )
 
-# ==================================================
-# LISTA DE CUENTAS (01kaosnet@gmail.com ... 100kaosnet@gmail.com)
-# ==================================================
-NUMEROS = [str(n).zfill(2) for n in range(1, 101)]  # ["01", "02", ..., "99", "100"]
+# Regex para extraer el número de cuenta de una dirección NNkaosnet@gmail.com
+ACCOUNT_REGEX = re.compile(r'(\d{1,3})kaosnet@gmail\.com', re.IGNORECASE)
+
+# Número de cuenta del master (None si el master no tiene formato NNkaosnet)
+_match_master = ACCOUNT_REGEX.search(MASTER_INBOX)
+MASTER_NUMERO = f"{int(_match_master.group(1)):02d}" if _match_master else None
+
+# Cuántos correos recientes leer del master en cada consulta
+MAX_CORREOS = 30
+
+# Cuántos códigos mostrar cuando /netflix se invoca sin argumento
+MAX_RESULTADOS_LISTADO = 5
 
 
 # --------------------------------------------------
@@ -71,15 +82,54 @@ def extraer_codigo_otp(cuerpo: str) -> str | None:
     return None
 
 
-def buscar_en_cuenta(correo: str) -> tuple[str | None, str | None]:
+def extraer_cuenta_origen(msg) -> str | None:
     """
-    Conecta a una cuenta de Gmail vía IMAP y busca el código más reciente
-    de un correo de Netflix. Cierra la conexión siempre, incluso si hay error.
+    Devuelve el número de cuenta original (zero-padded a 2 dígitos) del correo.
+    Usa X-Forwarded-For (primera dirección de la cadena) si el correo llegó
+    via reenvío; si no, asume que llegó directo al master y devuelve MASTER_NUMERO.
     """
+    forwarded = msg.get("X-Forwarded-For")
+    if forwarded:
+        partes = forwarded.split()
+        if partes:
+            match = ACCOUNT_REGEX.search(partes[0])
+            if match:
+                return f"{int(match.group(1)):02d}"
+        return None
+    # No hay X-Forwarded-For → llegó directo al master
+    return MASTER_NUMERO
+
+
+def tiempo_relativo(dt: datetime) -> str:
+    """Formatea un datetime como tiempo relativo: 'hace 15 seg', 'hace 2 min', etc."""
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = now - dt
+    segundos = int(delta.total_seconds())
+    if segundos < 60:
+        return f"hace {segundos} seg"
+    minutos = segundos // 60
+    if minutos < 60:
+        return f"hace {minutos} min"
+    horas = minutos // 60
+    if horas < 24:
+        return f"hace {horas} h"
+    dias = horas // 24
+    return f"hace {dias} d"
+
+
+def buscar_codigos_en_master() -> list[dict]:
+    """
+    Conecta al MASTER_INBOX, lee los últimos correos de Netflix, y devuelve
+    una lista de dicts: {"cuenta": "17", "codigo": "1234", "dt": datetime}
+    ordenada del más reciente al más antiguo.
+    """
+    resultados = []
     mail = None
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
-        mail.login(correo, PASSWORD)
+        mail.login(MASTER_INBOX, PASSWORD)
         mail.select("inbox")
 
         # Buscar correos de Netflix directamente desde el servidor (más eficiente)
@@ -87,10 +137,10 @@ def buscar_en_cuenta(correo: str) -> tuple[str | None, str | None]:
         ids_lista = ids[0].split()
 
         if not ids_lista:
-            return None, None
+            return []
 
-        # Revisar los últimos 30 correos de Netflix (de más reciente a más antiguo)
-        for id_correo in reversed(ids_lista[-30:]):
+        # Revisar los últimos MAX_CORREOS correos de Netflix (de más reciente a más antiguo)
+        for id_correo in reversed(ids_lista[-MAX_CORREOS:]):
             _, data = mail.fetch(id_correo, "(RFC822)")
             for part in data:
                 if not isinstance(part, tuple):
@@ -117,17 +167,29 @@ def buscar_en_cuenta(correo: str) -> tuple[str | None, str | None]:
                         cuerpo = payload.decode("utf-8", errors="ignore")
 
                 codigo = extraer_codigo_otp(cuerpo)
-                if codigo:
-                    return correo, codigo
+                if not codigo:
+                    continue
 
-        return None, None
+                cuenta = extraer_cuenta_origen(msg)
+                if not cuenta:
+                    # No identificable (master sin formato NN y sin X-Forwarded-For)
+                    continue
+
+                try:
+                    dt = parsedate_to_datetime(msg.get("Date", ""))
+                except (TypeError, ValueError):
+                    dt = datetime.now(timezone.utc)
+
+                resultados.append({"cuenta": cuenta, "codigo": codigo, "dt": dt})
+
+        return resultados
 
     except imaplib.IMAP4.error as e:
-        print(f"   [IMAP Error] {correo}: {e}")
-        return None, None
+        print(f"   [IMAP Error] {MASTER_INBOX}: {e}")
+        return []
     except Exception as e:
-        print(f"   [Error] {correo}: {e}")
-        return None, None
+        print(f"   [Error] {MASTER_INBOX}: {e}")
+        return []
     finally:
         # Siempre cerrar la conexión, sin importar qué pasó
         if mail:
@@ -135,30 +197,6 @@ def buscar_en_cuenta(correo: str) -> tuple[str | None, str | None]:
                 mail.logout()
             except Exception:
                 pass
-
-
-def buscar_codigo(numero_filtro: str = "") -> tuple[str | None, str | None]:
-    """
-    Busca en una cuenta específica (si se da filtro) o en todas las cuentas.
-    """
-    if numero_filtro:
-        numeros_a_buscar = [numero_filtro.zfill(2)]
-    else:
-        numeros_a_buscar = NUMEROS
-
-    print(f"🔍 Buscando en {len(numeros_a_buscar)} cuenta(s)...")
-
-    for numero in numeros_a_buscar:
-        correo = f"{numero}kaosnet@gmail.com"
-        print(f"   Revisando: {correo}")
-
-        cuenta, codigo = buscar_en_cuenta(correo)
-        if codigo:
-            return cuenta, codigo
-
-        time.sleep(1)  # Pausa de 1 segundo para no saturar Gmail
-
-    return None, None
 
 
 # --------------------------------------------------
@@ -169,14 +207,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_CHAT_ID:
         return
     await update.message.reply_text(
-        "🤖 *Bot de Códigos v13.0*\n\n"
-        "✅ Revisa las 100 cuentas individualmente\n"
-        "📧 Rango: `01kaosnet@gmail.com` → `100kaosnet@gmail.com`\n\n"
-        "📌 *Ejemplos:*\n"
-        "• `/netflix` → Busca en TODAS las cuentas\n"
-        "• `/netflix 46` → Busca SOLO en `46kaosnet@gmail.com`\n"
-        "• `/netflix 60` → Busca SOLO en `60kaosnet@gmail.com`\n\n"
-        "⚡ Revisa la bandeja de cada cuenta individualmente.",
+        "🤖 *Bot de Códigos v14.0*\n\n"
+        "✅ Lee todos los códigos desde un solo buzón master\n"
+        f"📥 Buzón master actual: `{MASTER_INBOX}`\n\n"
+        "📌 *Comandos:*\n"
+        "• `/netflix 17` → código de la cuenta `17kaosnet`\n"
+        "• `/netflix 42` → código de la cuenta `42kaosnet`\n"
+        "• `/netflix` (sin número) → últimos códigos con cuenta y hora\n\n"
+        "⚡ Identifica la cuenta original por el header `X-Forwarded-For` del reenvío Gmail.",
         parse_mode="Markdown"
     )
 
@@ -185,33 +223,72 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_CHAT_ID:
         return
 
-    filtro = context.args[0] if context.args else ""
-    destino = f"la cuenta *{filtro.zfill(2)}kaosnet@gmail.com*" if filtro else "todas las cuentas"
+    filtro_raw = context.args[0] if context.args else ""
+    filtro = None
+    if filtro_raw:
+        try:
+            n = int(filtro_raw)
+            if not (1 <= n <= 100):
+                await update.message.reply_text(
+                    "❌ El número de cuenta debe estar entre 01 y 100.",
+                    parse_mode="Markdown"
+                )
+                return
+            filtro = f"{n:02d}"
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Formato inválido. Usa por ejemplo: `/netflix 17`",
+                parse_mode="Markdown"
+            )
+            return
+
+    destino = f"la cuenta *{filtro}kaosnet@gmail.com*" if filtro else "el buzón master"
     mensaje_espera = await update.message.reply_text(
-        f"🔍 Buscando en {destino}...\n_(puede tomar hasta 60 segundos)_",
+        f"🔍 Buscando en {destino}...",
         parse_mode="Markdown"
     )
 
-    cuenta, codigo = buscar_codigo(filtro)
-
+    resultados = buscar_codigos_en_master()
     await mensaje_espera.delete()
 
-    if codigo:
+    if not resultados:
+        await update.message.reply_text(
+            "❌ No encontré correos de Netflix recientes en el buzón master.\n\n"
+            "💡 Verifica que el cliente haya intentado entrar y vuelve a intentar en unos segundos.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Ordenar siempre del más reciente al más antiguo
+    resultados.sort(key=lambda r: r["dt"], reverse=True)
+
+    if filtro:
+        coincidencias = [r for r in resultados if r["cuenta"] == filtro]
+        if not coincidencias:
+            await update.message.reply_text(
+                f"❌ No encontré códigos para la cuenta *{filtro}*.\n\n"
+                "💡 Verifica que el cliente haya intentado entrar y vuelve a intentar en unos segundos.",
+                parse_mode="Markdown"
+            )
+            return
+        mas_reciente = coincidencias[0]
         await update.message.reply_text(
             f"✅ *Código de Netflix encontrado*\n\n"
-            f"📧 Cuenta: `{cuenta}`\n"
-            f"🔢 Código: `{codigo}`",
+            f"📧 Cuenta: `{mas_reciente['cuenta']}kaosnet@gmail.com`\n"
+            f"🔢 Código: `{mas_reciente['codigo']}`\n"
+            f"⏱ Recibido: {tiempo_relativo(mas_reciente['dt'])}",
             parse_mode="Markdown"
         )
-    else:
-        await update.message.reply_text(
-            "❌ No encontré códigos de Netflix.\n\n"
-            "💡 *Posibles causas:*\n"
-            "• El correo aún no llegó (espera unos segundos y vuelve a intentar)\n"
-            "• La contraseña de aplicación expiró\n"
-            "• El número de cuenta no tiene correos de Netflix",
-            parse_mode="Markdown"
+        return
+
+    # Sin filtro: listar los últimos N códigos
+    top = resultados[:MAX_RESULTADOS_LISTADO]
+    lineas = ["📧 *Códigos recientes:*\n"]
+    for r in top:
+        lineas.append(
+            f"• `{r['codigo']}` — cuenta `{r['cuenta']}` — {tiempo_relativo(r['dt'])}"
         )
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
 
 # --------------------------------------------------
@@ -219,9 +296,12 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 
 def main():
-    print("🤖 Bot v13.0 iniciando...")
-    print(f"📧 Revisará {len(NUMEROS)} cuentas individualmente")
-    print("   Rango: 01kaosnet@gmail.com → 100kaosnet@gmail.com")
+    print("🤖 Bot v14.0 iniciando...")
+    print(f"📥 Buzón master: {MASTER_INBOX}")
+    if MASTER_NUMERO:
+        print(f"   Número de cuenta del master: {MASTER_NUMERO}")
+    else:
+        print("   ⚠️ El master no tiene formato NNkaosnet@gmail.com — correos sin X-Forwarded-For serán ignorados")
     print("✅ Bot listo!")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
