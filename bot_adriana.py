@@ -51,6 +51,13 @@ OTP_REGEX = re.compile(r'(?<!\d)(\d{4}|\d{6}|\d{8})(?!\d)')
 # Palabras clave en el cuerpo que indican que el código está cerca
 CONTEXT_KEYWORDS = ["código", "code", "verificación", "verification", "acceso", "access"]
 
+# Link del botón "Obtener código" en correos de "código de acceso temporal" (viaje).
+# El path /account/travel/verify es único de ese tipo de correo.
+TRAVEL_REGEX = re.compile(
+    r'https?://[^\s<>"\']*netflix\.com/account/travel/verify[^\s<>"\']*',
+    re.IGNORECASE
+)
+
 
 def extraer_codigo_otp(cuerpo: str) -> str | None:
     """
@@ -80,6 +87,12 @@ def extraer_codigo_otp(cuerpo: str) -> str | None:
         return match.group(1)
 
     return None
+
+
+def extraer_link_viaje(cuerpo: str) -> str | None:
+    """Devuelve la URL del botón 'Obtener código' si el correo es de viaje, sino None."""
+    match = TRAVEL_REGEX.search(cuerpo)
+    return match.group(0) if match else None
 
 
 def extraer_cuenta_origen(msg) -> str | None:
@@ -122,8 +135,10 @@ def tiempo_relativo(dt: datetime) -> str:
 def buscar_codigos_en_master() -> list[dict]:
     """
     Conecta al MASTER_INBOX, lee los últimos correos de Netflix, y devuelve
-    una lista de dicts: {"cuenta": "17", "codigo": "1234", "dt": datetime}
-    ordenada del más reciente al más antiguo.
+    una lista de dicts:
+      {"cuenta": "17", "tipo": "otp",   "valor": "1234",          "dt": datetime}
+      {"cuenta": "42", "tipo": "viaje", "valor": "https://...",   "dt": datetime}
+    Ordenada del más reciente al más antiguo.
     """
     resultados = []
     mail = None
@@ -167,7 +182,8 @@ def buscar_codigos_en_master() -> list[dict]:
                         cuerpo = payload.decode("utf-8", errors="ignore")
 
                 codigo = extraer_codigo_otp(cuerpo)
-                if not codigo:
+                link_viaje = None if codigo else extraer_link_viaje(cuerpo)
+                if not codigo and not link_viaje:
                     continue
 
                 cuenta = extraer_cuenta_origen(msg)
@@ -180,7 +196,10 @@ def buscar_codigos_en_master() -> list[dict]:
                 except (TypeError, ValueError):
                     dt = datetime.now(timezone.utc)
 
-                resultados.append({"cuenta": cuenta, "codigo": codigo, "dt": dt})
+                if codigo:
+                    resultados.append({"cuenta": cuenta, "tipo": "otp", "valor": codigo, "dt": dt})
+                else:
+                    resultados.append({"cuenta": cuenta, "tipo": "viaje", "valor": link_viaje, "dt": dt})
 
         return resultados
 
@@ -207,13 +226,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MI_CHAT_ID:
         return
     await update.message.reply_text(
-        "🤖 *Bot de Códigos v14.0*\n\n"
+        "🤖 *Bot de Códigos v14.1*\n\n"
         "✅ Lee todos los códigos desde un solo buzón master\n"
         f"📥 Buzón master actual: `{MASTER_INBOX}`\n\n"
         "📌 *Comandos:*\n"
         "• `/netflix 17` → código de la cuenta `17kaosnet`\n"
         "• `/netflix 42` → código de la cuenta `42kaosnet`\n"
         "• `/netflix` (sin número) → últimos códigos con cuenta y hora\n\n"
+        "🧳 *Códigos de viaje:* Netflix los manda como link (no como número). "
+        "El bot detecta el link y te lo pasa; al abrirlo verás el código (vence en 15 min).\n\n"
         "⚡ Identifica la cuenta original por el header `X-Forwarded-For` del reenvío Gmail.",
         parse_mode="Markdown"
     )
@@ -272,23 +293,43 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         mas_reciente = coincidencias[0]
-        await update.message.reply_text(
-            f"✅ *Código de Netflix encontrado*\n\n"
-            f"📧 Cuenta: `{mas_reciente['cuenta']}kaosnet@gmail.com`\n"
-            f"🔢 Código: `{mas_reciente['codigo']}`\n"
-            f"⏱ Recibido: {tiempo_relativo(mas_reciente['dt'])}",
-            parse_mode="Markdown"
-        )
+        if mas_reciente['tipo'] == 'otp':
+            await update.message.reply_text(
+                f"✅ *Código de Netflix encontrado*\n\n"
+                f"📧 Cuenta: `{mas_reciente['cuenta']}kaosnet@gmail.com`\n"
+                f"🔢 Código: `{mas_reciente['valor']}`\n"
+                f"⏱ Recibido: {tiempo_relativo(mas_reciente['dt'])}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"🧳 *Código de viaje*\n\n"
+                f"📧 Cuenta: `{mas_reciente['cuenta']}kaosnet@gmail.com`\n"
+                f"⏱ Recibido: {tiempo_relativo(mas_reciente['dt'])}\n"
+                f"_Abre este enlace para ver el código (vence en 15 min):_\n\n"
+                f"{mas_reciente['valor']}",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
         return
 
     # Sin filtro: listar los últimos N códigos
     top = resultados[:MAX_RESULTADOS_LISTADO]
     lineas = ["📧 *Códigos recientes:*\n"]
     for r in top:
-        lineas.append(
-            f"• `{r['codigo']}` — cuenta `{r['cuenta']}` — {tiempo_relativo(r['dt'])}"
-        )
-    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+        if r['tipo'] == 'otp':
+            lineas.append(
+                f"• `{r['valor']}` — cuenta `{r['cuenta']}` — {tiempo_relativo(r['dt'])}"
+            )
+        else:
+            lineas.append(
+                f"• 🧳 viaje — cuenta `{r['cuenta']}` — {tiempo_relativo(r['dt'])}\n   {r['valor']}"
+            )
+    await update.message.reply_text(
+        "\n".join(lineas),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
 
 
 # --------------------------------------------------
@@ -296,7 +337,7 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 
 def main():
-    print("🤖 Bot v14.0 iniciando...")
+    print("🤖 Bot v14.1 iniciando...")
     print(f"📥 Buzón master: {MASTER_INBOX}")
     if MASTER_NUMERO:
         print(f"   Número de cuenta del master: {MASTER_NUMERO}")
