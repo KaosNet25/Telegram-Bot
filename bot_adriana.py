@@ -1,5 +1,6 @@
 import imaplib
 import email
+import json
 import re
 import os
 from datetime import datetime, timezone
@@ -39,6 +40,52 @@ MAX_CORREOS = 30
 
 # Cuántos códigos mostrar cuando /netflix se invoca sin argumento
 MAX_RESULTADOS_LISTADO = 5
+
+
+# --------------------------------------------------
+# AUTORIZACIÓN MULTI-USUARIO
+# Adriana (MI_CHAT_ID) es admin permanente, hardcoded vía env var.
+# Otros usuarios autorizados viven en AUTH_PATH (Railway Volume persistente).
+# Si /data no está montado (no hay volume), fallback a /tmp — funciona pero
+# la lista NO sobrevive reinicios del contenedor.
+# --------------------------------------------------
+AUTH_PATH = os.environ.get("AUTH_PATH", "/data/authorized.json")
+try:
+    os.makedirs(os.path.dirname(AUTH_PATH), exist_ok=True)
+    _probe = AUTH_PATH + ".probe"
+    with open(_probe, "w") as _f:
+        _f.write("")
+    os.remove(_probe)
+except OSError:
+    AUTH_PATH = "/tmp/authorized.json"
+    print(f"⚠️ /data no escribible (Railway Volume no montado). Fallback: {AUTH_PATH} (NO persiste entre reinicios)")
+
+
+def cargar_autorizados() -> dict:
+    if not os.path.exists(AUTH_PATH):
+        return {}
+    try:
+        with open(AUTH_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"⚠️ No pude leer {AUTH_PATH}: {e}. Empezando con lista vacía.")
+        return {}
+
+
+def guardar_autorizados(data: dict) -> None:
+    with open(AUTH_PATH, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+autorizados = cargar_autorizados()
+
+
+def es_admin(user_id: int) -> bool:
+    return user_id == MI_CHAT_ID
+
+
+def es_autorizado(user_id: int) -> bool:
+    return es_admin(user_id) or str(user_id) in autorizados
 
 
 # --------------------------------------------------
@@ -223,10 +270,11 @@ def buscar_codigos_en_master() -> list[dict]:
 # --------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MI_CHAT_ID:
+    user_id = update.effective_user.id
+    if not es_autorizado(user_id):
         return
-    await update.message.reply_text(
-        "🤖 *Bot de Códigos v14.1*\n\n"
+    texto = (
+        "🤖 *Bot de Códigos v14.2*\n\n"
         "✅ Lee todos los códigos desde un solo buzón master\n"
         f"📥 Buzón master actual: `{MASTER_INBOX}`\n\n"
         "📌 *Comandos:*\n"
@@ -234,14 +282,115 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/netflix 42` → código de la cuenta `42kaosnet`\n"
         "• `/netflix` (sin número) → últimos códigos con cuenta y hora\n\n"
         "🧳 *Códigos de viaje:* Netflix los manda como link (no como número). "
-        "El bot detecta el link y te lo pasa; al abrirlo verás el código (vence en 15 min).\n\n"
-        "⚡ Identifica la cuenta original por el header `X-Forwarded-For` del reenvío Gmail.",
+        "El bot detecta el link y te lo pasa; al abrirlo verás el código (vence en 15 min)."
+    )
+    if es_admin(user_id):
+        texto += (
+            "\n\n🔐 *Comandos de admin:*\n"
+            "• `/autorizar <id> <nombre>` → dar acceso a otra persona\n"
+            "• `/revocar <id>` → quitar acceso\n"
+            "• `/lista` → ver quién tiene acceso\n\n"
+            "_Cada persona obtiene su ID escribiéndole `/start` a_ `@userinfobot` _en Telegram._"
+        )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+async def autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Uso: `/autorizar <id> <nombre>`\n"
+            "Ejemplo: `/autorizar 1091637952 Pedro`\n\n"
+            "El ID lo obtiene cada persona escribiéndole `/start` a `@userinfobot`.",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser un número entero.", parse_mode="Markdown")
+        return
+    if target_id == MI_CHAT_ID:
+        await update.message.reply_text(
+            "ℹ️ Ya eres admin permanente, no hace falta autorizarte.",
+            parse_mode="Markdown"
+        )
+        return
+    nombre = " ".join(context.args[1:])
+    autorizados[str(target_id)] = {
+        "nombre": nombre,
+        "agregado": datetime.now(timezone.utc).isoformat()
+    }
+    guardar_autorizados(autorizados)
+    await update.message.reply_text(
+        f"✅ Autorizado: *{nombre}* (`{target_id}`)\n\n"
+        f"Total: {len(autorizados)} usuarios (sin contarte).",
         parse_mode="Markdown"
     )
 
 
+async def revocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "❌ Uso: `/revocar <id>`\n"
+            "Ejemplo: `/revocar 1091637952`\n\n"
+            "Usa `/lista` para ver los IDs autorizados.",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser un número entero.", parse_mode="Markdown")
+        return
+    if target_id == MI_CHAT_ID:
+        await update.message.reply_text(
+            "❌ No puedes revocarte a ti misma (eres admin permanente).",
+            parse_mode="Markdown"
+        )
+        return
+    info = autorizados.pop(str(target_id), None)
+    if info is None:
+        await update.message.reply_text(
+            f"ℹ️ El ID `{target_id}` no estaba en la lista. Nada que hacer.",
+            parse_mode="Markdown"
+        )
+        return
+    guardar_autorizados(autorizados)
+    await update.message.reply_text(
+        f"✅ Revocado: *{info.get('nombre', '?')}* (`{target_id}`).\n\n"
+        f"Quedan {len(autorizados)} usuarios autorizados (sin contarte).",
+        parse_mode="Markdown"
+    )
+
+
+async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not es_admin(update.effective_user.id):
+        return
+    if not autorizados:
+        await update.message.reply_text(
+            "👤 Solo tú tienes acceso por ahora.\n\n"
+            "Para agregar a alguien: `/autorizar <id> <nombre>`",
+            parse_mode="Markdown"
+        )
+        return
+    lineas = [f"👥 *Usuarios autorizados ({len(autorizados)}):*\n"]
+    for uid, info in autorizados.items():
+        try:
+            dt = datetime.fromisoformat(info["agregado"])
+            tiempo = tiempo_relativo(dt)
+        except (KeyError, ValueError, TypeError):
+            tiempo = "?"
+        lineas.append(f"• *{info.get('nombre', '?')}* — `{uid}` — agregado {tiempo}")
+    lineas.append("\n_(Tú eres admin permanente, no apareces en la lista)_")
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+
+
 async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MI_CHAT_ID:
+    if not es_autorizado(update.effective_user.id):
         return
 
     filtro_raw = context.args[0] if context.args else ""
@@ -337,17 +486,22 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 
 def main():
-    print("🤖 Bot v14.1 iniciando...")
+    print("🤖 Bot v14.2 iniciando...")
     print(f"📥 Buzón master: {MASTER_INBOX}")
     if MASTER_NUMERO:
         print(f"   Número de cuenta del master: {MASTER_NUMERO}")
     else:
         print("   ⚠️ El master no tiene formato NNkaosnet@gmail.com — correos sin X-Forwarded-For serán ignorados")
+    print(f"👥 Autorizados al arrancar: {len(autorizados)} usuario(s) + admin {MI_CHAT_ID}")
+    print(f"💾 Persistencia: {AUTH_PATH}")
     print("✅ Bot listo!")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("netflix", netflix))
+    app.add_handler(CommandHandler("autorizar", autorizar))
+    app.add_handler(CommandHandler("revocar", revocar))
+    app.add_handler(CommandHandler("lista", lista))
     app.run_polling()
 
 
