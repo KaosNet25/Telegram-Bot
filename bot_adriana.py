@@ -98,6 +98,19 @@ OTP_REGEX = re.compile(r'(?<!\d)(\d{4}|\d{6}|\d{8})(?!\d)')
 # Palabras clave en el cuerpo que indican que el código está cerca
 CONTEXT_KEYWORDS = ["código", "code", "verificación", "verification", "acceso", "access"]
 
+# Palabras clave en el asunto que identifican un correo de OTP/sign-in.
+# El filtro IMAP FROM "netflix.com" ya garantiza origen Netflix; este check
+# adicional excluye correos promocionales sin descartar OTPs legítimos.
+# Incluye variantes es/en porque Netflix usa subjects como:
+#   "Tu código de verificación" (6 dígitos, cambio de cuenta — sin "netflix")
+#   "Nuevo inicio de sesión en Netflix" (4 dígitos)
+#   "Your Netflix verification code"
+#   "Código de acceso temporal" (viaje)
+SUBJECT_KEYWORDS = (
+    "netflix", "código", "code", "verificación", "verification",
+    "acceso", "access", "sign", "sesión", "inicio",
+)
+
 # Link del botón "Obtener código" en correos de "código de acceso temporal" (viaje).
 # El path /account/travel/verify es único de ese tipo de correo.
 TRAVEL_REGEX = re.compile(
@@ -211,8 +224,8 @@ def buscar_codigos_en_master() -> list[dict]:
                 msg = email.message_from_bytes(part[1])
                 asunto = msg.get("Subject", "").lower()
 
-                # Filtrar solo correos con "netflix" en el asunto
-                if "netflix" not in asunto:
+                # Filtrar correos cuyo asunto no parece OTP/sign-in (excluye promos).
+                if not any(kw in asunto for kw in SUBJECT_KEYWORDS):
                     continue
 
                 # Extraer el cuerpo en texto plano
@@ -274,7 +287,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not es_autorizado(user_id):
         return
     texto = (
-        "🤖 *Bot de Códigos v14.2*\n\n"
+        "🤖 *Bot de Códigos v14.3*\n\n"
         "✅ Lee todos los códigos desde un solo buzón master\n"
         f"📥 Buzón master actual: `{MASTER_INBOX}`\n\n"
         "📌 *Comandos:*\n"
@@ -486,7 +499,7 @@ async def netflix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 
 def main():
-    print("🤖 Bot v14.2 iniciando...")
+    print("🤖 Bot v14.3 iniciando...")
     print(f"📥 Buzón master: {MASTER_INBOX}")
     if MASTER_NUMERO:
         print(f"   Número de cuenta del master: {MASTER_NUMERO}")
